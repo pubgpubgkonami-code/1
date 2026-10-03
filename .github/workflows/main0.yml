@@ -1,0 +1,65 @@
+name: Eden APK (direct edit)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/node_modules || true
+          df -h /
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y glslang-tools cmake ninja-build ccache python3
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - name: Build APK
+        run: |
+          cd src/android
+          chmod +x gradlew
+          TASK=$(./gradlew -q tasks --all --no-daemon 2>/dev/null | grep -oE '^[A-Za-z:]*assemble[A-Za-z]*Release' | grep -i mainline | head -1 || true)
+          if [ -z "$TASK" ]; then TASK=assembleRelease; fi
+          echo "Using gradle task: $TASK"
+          ./gradlew "$TASK" --no-daemon --stacktrace
+
+      - name: Sign APK if unsigned
+        run: |
+          cd src/android
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          keytool -genkeypair -keystore /tmp/k.jks -storepass android -keypass android \
+            -alias k -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Eden"
+          mkdir -p /tmp/out
+          for f in $(find . -name "*.apk" -path "*release*"); do
+            b=$(basename "$f" .apk)
+            if "$BT/apksigner" verify "$f" >/dev/null 2>&1; then
+              cp "$f" "/tmp/out/$b.apk"
+            else
+              "$BT/zipalign" -f -p 4 "$f" "/tmp/aligned.apk"
+              "$BT/apksigner" sign --ks /tmp/k.jks --ks-pass pass:android --key-pass pass:android \
+                --out "/tmp/out/$b-signed.apk" /tmp/aligned.apk
+            fi
+          done
+          ls -la /tmp/out
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: eden-touch-camera-apk
+          path: /tmp/out/*.apk
