@@ -223,6 +223,88 @@ class InputOverlay(context: Context, attrs: AttributeSet?) :
         }
     }
 
+    // ---- EDEN_TOUCH_CAMERA ----
+    // Swipe on the empty right side of the screen = right stick (camera).
+    // Camera speed = finger speed * EDEN_SENSITIVITY
+    private val EDEN_SENSITIVITY = 1.0f   // camera speed multiplier
+    private val EDEN_REF_SPEED = 900.0f   // px/s needed for full stick (lower = faster camera)
+    private val EDEN_ZONE_X = 0.50f       // swipe zone starts at width * this
+    private val EDEN_ZONE_Y = 0.10f       // swipe zone starts at height * this
+    private val EDEN_X_SIGN = 1.0f        // -1.0f to invert left/right
+    private val EDEN_Y_SIGN = -1.0f       // 1.0f to invert up/down
+
+    private var edenCamId = -1
+    private var edenLastX = 0f
+    private var edenLastY = 0f
+    private var edenLastT = 0L
+    private var edenVx = 0f
+    private var edenVy = 0f
+    private val edenStop = Runnable { edenVx = 0f; edenVy = 0f; edenSend(0f, 0f) }
+
+    private fun edenSend(x: Float, y: Float) {
+        val pi = when (NativeInput.getStyleIndex(0)) {
+            NpadStyleIndex.Handheld -> 8
+            else -> 0
+        }
+        NativeInput.onOverlayJoystickEvent(pi, NativeAnalog.RStick, x, y)
+    }
+
+    private fun edenHit(x: Int, y: Int): Boolean {
+        for (b in overlayButtons) if (b.bounds.contains(x, y)) return true
+        for (d in overlayDpads) if (d.bounds.contains(x, y)) return true
+        for (j in overlayJoysticks) if (j.bounds.contains(x, y)) return true
+        return false
+    }
+
+    private fun edenCamera(e: MotionEvent) {
+        when (e.actionMasked) {
+            MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
+                if (edenCamId != -1) return
+                val i = e.actionIndex
+                val x = e.getX(i)
+                val y = e.getY(i)
+                if (x < width * EDEN_ZONE_X || y < height * EDEN_ZONE_Y) return
+                if (edenHit(x.toInt(), y.toInt())) return
+                edenCamId = e.getPointerId(i)
+                edenLastX = x
+                edenLastY = y
+                edenLastT = e.eventTime
+                edenVx = 0f
+                edenVy = 0f
+            }
+            MotionEvent.ACTION_MOVE -> {
+                if (edenCamId == -1) return
+                val i = e.findPointerIndex(edenCamId)
+                if (i < 0) return
+                val x = e.getX(i)
+                val y = e.getY(i)
+                val dt = (e.eventTime - edenLastT).coerceAtLeast(1L) / 1000f
+                edenVx = edenVx * 0.5f + ((x - edenLastX) / dt) * 0.5f
+                edenVy = edenVy * 0.5f + ((y - edenLastY) / dt) * 0.5f
+                edenLastX = x
+                edenLastY = y
+                edenLastT = e.eventTime
+                val sx = (edenVx / EDEN_REF_SPEED * EDEN_SENSITIVITY).coerceIn(-1f, 1f)
+                val sy = (edenVy / EDEN_REF_SPEED * EDEN_SENSITIVITY).coerceIn(-1f, 1f)
+                edenSend(sx * EDEN_X_SIGN, sy * EDEN_Y_SIGN)
+                removeCallbacks(edenStop)
+                postDelayed(edenStop, 50L)
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_POINTER_UP, MotionEvent.ACTION_CANCEL -> {
+                if (edenCamId == -1) return
+                val i = e.actionIndex
+                if (e.actionMasked == MotionEvent.ACTION_CANCEL || e.getPointerId(i) == edenCamId) {
+                    edenCamId = -1
+                    removeCallbacks(edenStop)
+                    edenVx = 0f
+                    edenVy = 0f
+                    edenSend(0f, 0f)
+                }
+            }
+        }
+    }
+    // ---- END EDEN_TOUCH_CAMERA ----
+
     override fun onTouch(v: View, event: MotionEvent): Boolean {
         try {
             touchEventListener?.invoke(event)
@@ -231,6 +313,8 @@ class InputOverlay(context: Context, attrs: AttributeSet?) :
         if (inEditMode) {
             return onTouchWhileEditing(event)
         }
+
+        edenCamera(event)
 
         var shouldUpdateView = false
         val playerIndex = when (NativeInput.getStyleIndex(0)) {
@@ -353,6 +437,9 @@ class InputOverlay(context: Context, attrs: AttributeSet?) :
     }
 
     private fun isTouchInputConsumed(track_id: Int): Boolean {
+        if (track_id == edenCamId) {
+            return true
+        }
         for (button in overlayButtons) {
             if (button.trackId == track_id) {
                 return true
