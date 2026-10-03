@@ -58,6 +58,9 @@ class InputOverlay(context: Context, attrs: AttributeSet?) :
     private val overlayJoysticks: MutableSet<InputOverlayDrawableJoystick> = HashSet()
     private val imeEditable = Editable.Factory.getInstance().newEditable("")
 
+    // Sticky / Latch Map to track toggle state for specific buttons (L, R, ZL, ZR)
+    private val stickyButtonStates = HashMap<NativeButton, Boolean>()
+
     private var inEditMode = false
     private var gamelessMode = false
     private var buttonBeingConfigured: InputOverlayDrawableButton? = null
@@ -225,9 +228,9 @@ class InputOverlay(context: Context, attrs: AttributeSet?) :
 
     // ---- EDEN_TOUCH_CAMERA ----
     // Swipe on the empty right side of the screen = right stick (camera).
-    // Camera speed = finger speed * EDEN_SENSITIVITY
-    private val EDEN_SENSITIVITY = 3.0f   // camera speed multiplier
-    private val EDEN_REF_SPEED = 900.0f   // px/s needed for full stick (lower = faster camera)
+    // Sensitivity & reference speed tuned for faster camera rotation
+    private val EDEN_SENSITIVITY = 3.0f   // camera speed multiplier (increased from 1.0f)
+    private val EDEN_REF_SPEED = 500.0f   // px/s needed for full stick (lowered from 900.0f for higher speed)
     private val EDEN_ZONE_X = 0.50f       // swipe zone starts at width * this
     private val EDEN_ZONE_Y = 0.10f       // swipe zone starts at height * this
     private val EDEN_X_SIGN = 1.0f        // -1.0f to invert left/right
@@ -323,16 +326,48 @@ class InputOverlay(context: Context, attrs: AttributeSet?) :
         }
 
         for (button in overlayButtons) {
-            if (!button.updateStatus(event)) {
-                continue
+            val isStickyButton = button.button == NativeButton.L ||
+                                button.button == NativeButton.R ||
+                                button.button == NativeButton.ZL ||
+                                button.button == NativeButton.ZR
+
+            if (isStickyButton) {
+                // Custom Sticky / Latch handling for Triggers / Shoulder buttons
+                val pointerIndex = event.actionIndex
+                val x = event.getX(pointerIndex).toInt()
+                val y = event.getY(pointerIndex).toInt()
+
+                when (event.actionMasked) {
+                    MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
+                        if (button.bounds.contains(x, y)) {
+                            val currentState = stickyButtonStates[button.button] ?: false
+                            val newState = !currentState
+                            stickyButtonStates[button.button] = newState
+
+                            button.status = newState
+                            NativeInput.onOverlayButtonEvent(
+                                playerIndex,
+                                button.button,
+                                newState
+                            )
+                            playHaptics(event)
+                            shouldUpdateView = true
+                        }
+                    }
+                }
+            } else {
+                // Standard button behavior for all other buttons
+                if (!button.updateStatus(event)) {
+                    continue
+                }
+                NativeInput.onOverlayButtonEvent(
+                    playerIndex,
+                    button.button,
+                    button.status
+                )
+                playHaptics(event)
+                shouldUpdateView = true
             }
-            NativeInput.onOverlayButtonEvent(
-                playerIndex,
-                button.button,
-                button.status
-            )
-            playHaptics(event)
-            shouldUpdateView = true
         }
 
         for (dpad in overlayDpads) {
@@ -1312,7 +1347,7 @@ class InputOverlay(context: Context, attrs: AttributeSet?) :
          * @param defaultResId              The [Bitmap] resource ID of the default state.
          * @param pressedOneDirectionResId  The [Bitmap] resource ID of the pressed state in one direction.
          * @param pressedTwoDirectionsResId The [Bitmap] resource ID of the pressed state in two directions.
-         * @param position                  The position on screen as represented by an x and y value between 0 and 1.
+         * @position                  The position on screen as represented by an x and y value between 0 and 1.
          * @return The initialized [InputOverlayDrawableDpad]
          */
         private fun initializeOverlayDpad(
@@ -1462,4 +1497,4 @@ class InputOverlay(context: Context, attrs: AttributeSet?) :
             return overlayDrawable
         }
     }
-    }
+}
