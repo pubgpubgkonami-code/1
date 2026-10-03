@@ -237,7 +237,7 @@ class InputOverlay(context: Context, attrs: AttributeSet?) :
     // Swipe on the empty right side of the screen = right stick (camera).
     // Camera rotation is proportional to swipe DISTANCE (like mobile games),
     // executed at full stick, so the game's own camera speed is the only cap.
-    private val EDEN_SEC_PER_PX = 0.00025f  // BIGGER = camera turns MORE per px of swipe
+    private val EDEN_SEC_PER_PX = 0.0030f  // BIGGER = camera turns MORE per px of swipe
     private val EDEN_TAPER = 0.03f         // smoothness at the end of a swipe
     private val EDEN_MAX_ACC = 0.6f        // max stored turn (seconds of full stick)
     private val EDEN_ZONE_X = 0.50f        // swipe zone starts at width * this
@@ -1554,4 +1554,4 @@ class InputOverlay(context: Context, attrs: AttributeSet?) :
             return overlayDrawable
         }
     }
-}
+    }
