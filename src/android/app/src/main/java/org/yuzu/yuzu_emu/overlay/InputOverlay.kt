@@ -226,7 +226,7 @@ class InputOverlay(context: Context, attrs: AttributeSet?) :
     // ---- EDEN_TOUCH_CAMERA ----
     // Swipe on the empty right side of the screen = right stick (camera).
     // Camera speed = finger speed * EDEN_SENSITIVITY
-    private val EDEN_SENSITIVITY = 1.0f   // camera speed multiplier
+    private val EDEN_SENSITIVITY = 3.0f   // camera speed multiplier
     private val EDEN_REF_SPEED = 900.0f   // px/s needed for full stick (lower = faster camera)
     private val EDEN_ZONE_X = 0.50f       // swipe zone starts at width * this
     private val EDEN_ZONE_Y = 0.10f       // swipe zone starts at height * this
@@ -1462,4 +1462,4 @@ class InputOverlay(context: Context, attrs: AttributeSet?) :
             return overlayDrawable
         }
     }
-}
+    }
