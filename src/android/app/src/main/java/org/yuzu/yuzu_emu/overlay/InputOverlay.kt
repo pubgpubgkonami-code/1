@@ -4,6 +4,7 @@
 package org.yuzu.yuzu_emu.overlay
 
 import android.app.Activity
+import android.app.AlertDialog
 import android.content.Context
 import android.content.SharedPreferences
 import android.graphics.Bitmap
@@ -57,9 +58,6 @@ class InputOverlay(context: Context, attrs: AttributeSet?) :
     private val overlayDpads: MutableSet<InputOverlayDrawableDpad> = HashSet()
     private val overlayJoysticks: MutableSet<InputOverlayDrawableJoystick> = HashSet()
     private val imeEditable = Editable.Factory.getInstance().newEditable("")
-
-    // Sticky / Latch Map to track toggle state for specific buttons (L, R, ZL, ZR)
-    private val stickyButtonStates = HashMap<NativeButton, Boolean>()
 
     private var inEditMode = false
     private var gamelessMode = false
@@ -178,6 +176,15 @@ class InputOverlay(context: Context, attrs: AttributeSet?) :
 
         for (button in overlayButtons) {
             button.draw(canvas)
+            if (edenLatched.contains(button.overlayControlData.id)) {
+                val r = button.bounds
+                canvas.drawCircle(
+                    r.exactCenterX(),
+                    r.exactCenterY(),
+                    min(r.width(), r.height()) / 2f,
+                    edenLatchPaint
+                )
+            }
         }
         for (dpad in overlayDpads) {
             dpad.draw(canvas)
@@ -228,21 +235,56 @@ class InputOverlay(context: Context, attrs: AttributeSet?) :
 
     // ---- EDEN_TOUCH_CAMERA ----
     // Swipe on the empty right side of the screen = right stick (camera).
-    // Sensitivity & reference speed tuned for faster camera rotation
-    private val EDEN_SENSITIVITY = 3.0f   // camera speed multiplier (increased from 1.0f)
-    private val EDEN_REF_SPEED = 500.0f   // px/s needed for full stick (lowered from 900.0f for higher speed)
-    private val EDEN_ZONE_X = 0.50f       // swipe zone starts at width * this
-    private val EDEN_ZONE_Y = 0.10f       // swipe zone starts at height * this
-    private val EDEN_X_SIGN = 1.0f        // -1.0f to invert left/right
-    private val EDEN_Y_SIGN = -1.0f       // 1.0f to invert up/down
+    // Camera rotation is proportional to swipe DISTANCE (like mobile games),
+    // executed at full stick, so the game's own camera speed is the only cap.
+    private val EDEN_SEC_PER_PX = 0.00025f  // BIGGER = camera turns MORE per px of swipe
+    private val EDEN_TAPER = 0.03f         // smoothness at the end of a swipe
+    private val EDEN_MAX_ACC = 0.6f        // max stored turn (seconds of full stick)
+    private val EDEN_ZONE_X = 0.50f        // swipe zone starts at width * this
+    private val EDEN_ZONE_Y = 0.10f        // swipe zone starts at height * this
+    private val EDEN_X_SIGN = 1.0f         // -1.0f to invert left/right
+    private val EDEN_Y_SIGN = -1.0f        // 1.0f to invert up/down
 
     private var edenCamId = -1
     private var edenLastX = 0f
     private var edenLastY = 0f
-    private var edenLastT = 0L
-    private var edenVx = 0f
-    private var edenVy = 0f
-    private val edenStop = Runnable { edenVx = 0f; edenVy = 0f; edenSend(0f, 0f) }
+    private var edenAccX = 0f
+    private var edenAccY = 0f
+    private var edenTickT = 0L
+    private var edenTicking = false
+
+    private val edenTick = object : Runnable {
+        override fun run() {
+            val now = System.nanoTime()
+            val dt = ((now - edenTickT) / 1.0e9f).coerceIn(0.001f, 0.05f)
+            edenTickT = now
+            val ox = (edenAccX / EDEN_TAPER).coerceIn(-1f, 1f)
+            val oy = (edenAccY / EDEN_TAPER).coerceIn(-1f, 1f)
+            edenAccX -= ox * dt
+            edenAccY -= oy * dt
+            edenSend(ox * EDEN_X_SIGN, oy * EDEN_Y_SIGN)
+            if (kotlin.math.abs(edenAccX) < 0.0005f && kotlin.math.abs(edenAccY) < 0.0005f) {
+                edenAccX = 0f
+                edenAccY = 0f
+                edenSend(0f, 0f)
+                edenTicking = false
+            } else {
+                postDelayed(this, 8L)
+            }
+        }
+    }
+
+    // Sticky (latch) buttons: tap once = stays pressed, tap again = released.
+    private val edenPrefs = context.getSharedPreferences("eden_latch", Context.MODE_PRIVATE)
+    private val edenLatchIds: MutableSet<String> =
+        HashSet<String>(edenPrefs.getStringSet("ids", emptySet()) ?: emptySet())
+    private val edenLatched: MutableSet<String> = HashSet()
+    private val edenDownIds: MutableSet<String> = HashSet()
+    private val edenUnlatching: MutableSet<String> = HashSet()
+    private val edenLatchPaint = Paint().apply {
+        color = Color.argb(110, 0, 200, 255)
+        style = Paint.Style.FILL
+    }
 
     private fun edenSend(x: Float, y: Float) {
         val pi = when (NativeInput.getStyleIndex(0)) {
@@ -271,9 +313,6 @@ class InputOverlay(context: Context, attrs: AttributeSet?) :
                 edenCamId = e.getPointerId(i)
                 edenLastX = x
                 edenLastY = y
-                edenLastT = e.eventTime
-                edenVx = 0f
-                edenVy = 0f
             }
             MotionEvent.ACTION_MOVE -> {
                 if (edenCamId == -1) return
@@ -281,30 +320,53 @@ class InputOverlay(context: Context, attrs: AttributeSet?) :
                 if (i < 0) return
                 val x = e.getX(i)
                 val y = e.getY(i)
-                val dt = (e.eventTime - edenLastT).coerceAtLeast(1L) / 1000f
-                edenVx = edenVx * 0.5f + ((x - edenLastX) / dt) * 0.5f
-                edenVy = edenVy * 0.5f + ((y - edenLastY) / dt) * 0.5f
+                edenAccX = (edenAccX + (x - edenLastX) * EDEN_SEC_PER_PX)
+                    .coerceIn(-EDEN_MAX_ACC, EDEN_MAX_ACC)
+                edenAccY = (edenAccY + (y - edenLastY) * EDEN_SEC_PER_PX)
+                    .coerceIn(-EDEN_MAX_ACC, EDEN_MAX_ACC)
                 edenLastX = x
                 edenLastY = y
-                edenLastT = e.eventTime
-                val sx = (edenVx / EDEN_REF_SPEED * EDEN_SENSITIVITY).coerceIn(-1f, 1f)
-                val sy = (edenVy / EDEN_REF_SPEED * EDEN_SENSITIVITY).coerceIn(-1f, 1f)
-                edenSend(sx * EDEN_X_SIGN, sy * EDEN_Y_SIGN)
-                removeCallbacks(edenStop)
-                postDelayed(edenStop, 50L)
+                if (!edenTicking) {
+                    edenTicking = true
+                    edenTickT = System.nanoTime()
+                    post(edenTick)
+                }
             }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_POINTER_UP, MotionEvent.ACTION_CANCEL -> {
                 if (edenCamId == -1) return
                 val i = e.actionIndex
                 if (e.actionMasked == MotionEvent.ACTION_CANCEL || e.getPointerId(i) == edenCamId) {
                     edenCamId = -1
-                    removeCallbacks(edenStop)
-                    edenVx = 0f
-                    edenVy = 0f
-                    edenSend(0f, 0f)
+                    if (e.actionMasked == MotionEvent.ACTION_CANCEL) {
+                        edenAccX = 0f
+                        edenAccY = 0f
+                    }
                 }
             }
         }
+    }
+
+    private fun edenButtonDialog(button: InputOverlayDrawableButton, x: Int, y: Int) {
+        val bid = button.overlayControlData.id
+        val isLatch = edenLatchIds.contains(bid)
+        val items = arrayOf(
+            "Size",
+            if (isLatch) "Sticky: ON (tap to turn off)" else "Sticky: OFF (tap to turn on)"
+        )
+        AlertDialog.Builder(context)
+            .setItems(items) { _, which ->
+                if (which == 0) {
+                    showScaleDialog(button, null, null, x, y)
+                } else {
+                    if (isLatch) edenLatchIds.remove(bid) else edenLatchIds.add(bid)
+                    edenLatched.remove(bid)
+                    edenDownIds.remove(bid)
+                    edenUnlatching.remove(bid)
+                    edenPrefs.edit().putStringSet("ids", HashSet<String>(edenLatchIds)).apply()
+                    invalidate()
+                }
+            }
+            .show()
     }
     // ---- END EDEN_TOUCH_CAMERA ----
 
@@ -326,48 +388,45 @@ class InputOverlay(context: Context, attrs: AttributeSet?) :
         }
 
         for (button in overlayButtons) {
-            val isStickyButton = button.button == NativeButton.L ||
-                                button.button == NativeButton.R ||
-                                button.button == NativeButton.ZL ||
-                                button.button == NativeButton.ZR
-
-            if (isStickyButton) {
-                // Custom Sticky / Latch handling for Triggers / Shoulder buttons
-                val pointerIndex = event.actionIndex
-                val x = event.getX(pointerIndex).toInt()
-                val y = event.getY(pointerIndex).toInt()
-
-                when (event.actionMasked) {
-                    MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
-                        if (button.bounds.contains(x, y)) {
-                            val currentState = stickyButtonStates[button.button] ?: false
-                            val newState = !currentState
-                            stickyButtonStates[button.button] = newState
-
-                            button.status = newState
-                            NativeInput.onOverlayButtonEvent(
-                                playerIndex,
-                                button.button,
-                                newState
-                            )
-                            playHaptics(event)
-                            shouldUpdateView = true
-                        }
+            if (!button.updateStatus(event)) {
+                continue
+            }
+            val bid = button.overlayControlData.id
+            if (edenLatchIds.contains(bid)) {
+                val nowDown = if (edenDownIds.contains(bid)) {
+                    edenDownIds.remove(bid)
+                    false
+                } else {
+                    edenDownIds.add(bid)
+                    true
+                }
+                var send = true
+                if (nowDown) {
+                    if (edenLatched.contains(bid)) {
+                        edenUnlatching.add(bid)
+                        send = false
+                    } else {
+                        edenLatched.add(bid)
+                    }
+                } else {
+                    if (edenUnlatching.remove(bid)) {
+                        edenLatched.remove(bid)
+                    } else {
+                        send = false
                     }
                 }
-            } else {
-                // Standard button behavior for all other buttons
-                if (!button.updateStatus(event)) {
+                if (!send) {
+                    shouldUpdateView = true
                     continue
                 }
-                NativeInput.onOverlayButtonEvent(
-                    playerIndex,
-                    button.button,
-                    button.status
-                )
-                playHaptics(event)
-                shouldUpdateView = true
             }
+            NativeInput.onOverlayButtonEvent(
+                playerIndex,
+                button.button,
+                button.status
+            )
+            playHaptics(event)
+            shouldUpdateView = true
         }
 
         for (dpad in overlayDpads) {
@@ -531,10 +590,8 @@ class InputOverlay(context: Context, attrs: AttributeSet?) :
                 MotionEvent.ACTION_UP,
                 MotionEvent.ACTION_POINTER_UP -> if (buttonBeingConfigured === button) {
                     if (!hasMoved) {
-                        showScaleDialog(
-                            buttonBeingConfigured,
-                            null,
-                            null,
+                        edenButtonDialog(
+                            buttonBeingConfigured!!,
                             fingerPositionX,
                             fingerPositionY
                         )
@@ -1347,7 +1404,7 @@ class InputOverlay(context: Context, attrs: AttributeSet?) :
          * @param defaultResId              The [Bitmap] resource ID of the default state.
          * @param pressedOneDirectionResId  The [Bitmap] resource ID of the pressed state in one direction.
          * @param pressedTwoDirectionsResId The [Bitmap] resource ID of the pressed state in two directions.
-         * @position                  The position on screen as represented by an x and y value between 0 and 1.
+         * @param position                  The position on screen as represented by an x and y value between 0 and 1.
          * @return The initialized [InputOverlayDrawableDpad]
          */
         private fun initializeOverlayDpad(
