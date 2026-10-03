@@ -1,0 +1,216 @@
+name: Eden Touch Camera APK
+
+on:
+  workflow_dispatch:
+
+env:
+  # ---- دەتوانیت ئەمانە بگۆڕیت ----
+  REPO_URL: "https://github.com/eden-emulator/mirror.git"
+  COMMIT: ""            # بەتاڵ = دوایین کۆد. یان hash ی commit بنووسە
+  SENSITIVITY: "1.0"    # خێرای کامێرا (×). هەمیشە بە خاڵ بنووسە: 1.5
+  REF_SPEED: "900.0"    # px/s بۆ گەیشتن بە ستیکی تەواو. کەمتر = کامێرا خێراتر
+  ZONE_X: "0.50"        # سەوایپ لە x >= width * ئەم ژمارەیە دەست پێدەکات
+  ZONE_Y: "0.10"        # سەوایپ لە y >= height * ئەم ژمارەیە
+  CAM_X_SIGN: "1.0"     # بۆ پێچەوانەکردنەوەی چەپ/ڕاست: -1.0
+  CAM_Y_SIGN: "-1.0"    # ئەگەر سەرەوە/خوارەوە پێچەوانە بوو: 1.0
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Clone source
+        run: |
+          git clone "$REPO_URL" eden
+          cd eden
+          if [ -n "$COMMIT" ]; then git checkout "$COMMIT"; fi
+          git rev-parse HEAD
+
+      - name: Patch touch camera (fails fast if source differs)
+        run: |
+          cd eden
+          python3 - <<'PY'
+          import os, re, pathlib, sys
+
+          root = pathlib.Path("src/android")
+          ov = list(root.rglob("InputOverlay.kt"))
+          nl = list(root.rglob("NativeLibrary.kt"))
+          assert len(ov) == 1, "InputOverlay.kt not found: %s" % ov
+          assert len(nl) == 1, "NativeLibrary.kt not found: %s" % nl
+          ov, nl = ov[0], nl[0]
+          src = ov.read_text()
+          nsrc = nl.read_text()
+
+          # diagnostics: show every line mentioning the stick id or the joystick call
+          for p in sorted(root.rglob("*.kt")):
+              for n, line in enumerate(p.read_text(errors="ignore").splitlines(), 1):
+                  if "STICK_R" in line or "onGamePadJoystickEvent" in line:
+                      print("DIAG", p.name, n, line.strip())
+
+          # find how STICK_R is written inside InputOverlay.kt (so it is already in scope)
+          ms = re.search(r"((?:\w+\.)*STICK_R)\b", src)
+          if not ms:
+              for p in sorted(root.rglob("*.kt")):
+                  ms = re.search(r"((?:\w+\.)+STICK_R)\b", p.read_text(errors="ignore"))
+                  if ms:
+                      break
+          assert ms, "STICK_R not found anywhere in src/android (see DIAG lines above)"
+          stick = ms.group(1)
+          print("stick expr:", stick)
+
+          for name in ("overlayButtons", "overlayDpads", "overlayJoysticks"):
+              assert name in src, name + " missing in InputOverlay.kt"
+          assert "EDEN_TOUCH_CAMERA" not in src, "already patched"
+
+          m = re.search(r"NativeLibrary\.onGamePadJoystickEvent\(\s*([^,]+?)\s*,", src)
+          assert m, "no existing onGamePadJoystickEvent call to copy player arg from"
+          player = m.group(1)
+          print("player arg:", player)
+
+          sig = None
+          for mm in re.finditer(r"^[ \t]*override fun (onTouch|onTouchEvent)\([^\n]*MotionEvent[^\n]*\{[ \t]*$", src, re.M):
+              sig = mm
+              break
+          assert sig, "onTouch signature not found"
+          ev = re.search(r"(\w+)\s*:\s*MotionEvent", sig.group(0)).group(1)
+          print("touch fn:", sig.group(0).strip(), "| event var:", ev)
+
+          kt = '''
+              // ---- EDEN_TOUCH_CAMERA ----
+              private var edenCamId = -1
+              private var edenLastX = 0f
+              private var edenLastY = 0f
+              private var edenLastT = 0L
+              private var edenVx = 0f
+              private var edenVy = 0f
+              private val edenStop = Runnable { edenVx = 0f; edenVy = 0f; edenSend(0f, 0f) }
+
+              private fun edenSend(x: Float, y: Float) {
+                  NativeLibrary.onGamePadJoystickEvent(@PLAYER@, @STICK@, x, y)
+              }
+
+              private fun edenHit(x: Int, y: Int): Boolean {
+                  for (b in overlayButtons) if (b.bounds.contains(x, y)) return true
+                  for (d in overlayDpads) if (d.bounds.contains(x, y)) return true
+                  for (j in overlayJoysticks) if (j.bounds.contains(x, y)) return true
+                  return false
+              }
+
+              private fun edenCamera(e: MotionEvent) {
+                  when (e.actionMasked) {
+                      MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
+                          if (edenCamId != -1) return
+                          val i = e.actionIndex
+                          val x = e.getX(i)
+                          val y = e.getY(i)
+                          if (x < width * @ZX@f || y < height * @ZY@f) return
+                          if (edenHit(x.toInt(), y.toInt())) return
+                          edenCamId = e.getPointerId(i)
+                          edenLastX = x
+                          edenLastY = y
+                          edenLastT = e.eventTime
+                          edenVx = 0f
+                          edenVy = 0f
+                      }
+                      MotionEvent.ACTION_MOVE -> {
+                          if (edenCamId == -1) return
+                          val i = e.findPointerIndex(edenCamId)
+                          if (i < 0) return
+                          val x = e.getX(i)
+                          val y = e.getY(i)
+                          val dt = (e.eventTime - edenLastT).coerceAtLeast(1L) / 1000f
+                          edenVx = edenVx * 0.5f + ((x - edenLastX) / dt) * 0.5f
+                          edenVy = edenVy * 0.5f + ((y - edenLastY) / dt) * 0.5f
+                          edenLastX = x
+                          edenLastY = y
+                          edenLastT = e.eventTime
+                          val sx = (edenVx / @REF@f * @SENS@f).coerceIn(-1f, 1f)
+                          val sy = (edenVy / @REF@f * @SENS@f).coerceIn(-1f, 1f)
+                          edenSend(sx * @SX@f, sy * @SY@f)
+                          removeCallbacks(edenStop)
+                          postDelayed(edenStop, 50L)
+                      }
+                      MotionEvent.ACTION_UP, MotionEvent.ACTION_POINTER_UP, MotionEvent.ACTION_CANCEL -> {
+                          if (edenCamId == -1) return
+                          val i = e.actionIndex
+                          if (e.actionMasked == MotionEvent.ACTION_CANCEL || e.getPointerId(i) == edenCamId) {
+                              edenCamId = -1
+                              removeCallbacks(edenStop)
+                              edenVx = 0f
+                              edenVy = 0f
+                              edenSend(0f, 0f)
+                          }
+                      }
+                  }
+              }
+              // ---- END EDEN_TOUCH_CAMERA ----
+
+          '''
+          kt = (kt.replace("@PLAYER@", player)
+                  .replace("@STICK@", stick)
+                  .replace("@ZX@", os.environ["ZONE_X"])
+                  .replace("@ZY@", os.environ["ZONE_Y"])
+                  .replace("@REF@", os.environ["REF_SPEED"])
+                  .replace("@SENS@", os.environ["SENSITIVITY"])
+                  .replace("@SX@", os.environ["CAM_X_SIGN"])
+                  .replace("@SY@", os.environ["CAM_Y_SIGN"]))
+          # remove the 10-space YAML indentation level only (Python already stripped it)
+          call = "        edenCamera(%s)\n" % ev
+          out = src[:sig.start()] + kt + src[sig.start():sig.end()] + "\n" + call + src[sig.end():]
+          ov.write_text(out)
+          print("PATCH OK:", ov)
+          PY
+          grep -n "EDEN_TOUCH_CAMERA\|edenCamera(" -r src/android | head
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/node_modules || true
+          df -h /
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y glslang-tools cmake ninja-build ccache python3
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - name: Fetch submodules
+        run: |
+          cd eden
+          git submodule update --init --recursive --depth 1 || git submodule update --init --recursive
+
+      - name: Build APK
+        run: |
+          cd eden/src/android
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon --stacktrace
+
+      - name: Sign APK if unsigned
+        run: |
+          cd eden/src/android
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          keytool -genkeypair -keystore /tmp/k.jks -storepass android -keypass android \
+            -alias k -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Eden"
+          mkdir -p /tmp/out
+          for f in $(find . -name "*.apk" -path "*release*"); do
+            b=$(basename "$f" .apk)
+            if "$BT/apksigner" verify "$f" >/dev/null 2>&1; then
+              cp "$f" "/tmp/out/$b.apk"
+            else
+              "$BT/zipalign" -f -p 4 "$f" "/tmp/aligned.apk"
+              "$BT/apksigner" sign --ks /tmp/k.jks --ks-pass pass:android --key-pass pass:android \
+                --out "/tmp/out/$b-signed.apk" /tmp/aligned.apk
+            fi
+          done
+          ls -la /tmp/out
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: eden-touch-camera-apk
+          path: /tmp/out/*.apk
